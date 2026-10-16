@@ -830,7 +830,14 @@ func (c *OneBotChannel) parseMessageSegments(
 			}
 
 		case "forward":
-			textParts = append(textParts, "[forward message]")
+			text := "[forward message]"
+			if data != nil && data["id"] != nil {
+				id := fmt.Sprintf("%v", data["id"])
+				if resolved := c.fetchForwardText(id); resolved != "" {
+					text = resolved
+				}
+			}
+			textParts = append(textParts, text)
 
 		default:
 		}
@@ -841,6 +848,111 @@ func (c *OneBotChannel) parseMessageSegments(
 		IsBotMentioned: mentioned,
 		Media:          mediaRefs,
 		ReplyTo:        replyTo,
+	}
+}
+
+// fetchForwardText resolves an OneBot v11 forward segment id into readable text
+// via the get_forward_msg action. Returns "" when the content cannot be
+// resolved so callers keep the "[forward message]" placeholder.
+func (c *OneBotChannel) fetchForwardText(id string) string {
+	resp, err := c.sendAPIRequest("get_forward_msg", map[string]any{"id": id}, 8*time.Second)
+	if err != nil {
+		logger.DebugCF("onebot", "get_forward_msg failed", map[string]any{
+			"forward_id": id,
+			"error":      err.Error(),
+		})
+		return ""
+	}
+
+	var result struct {
+		RetCode int `json:"retcode"`
+		Data    struct {
+			Messages []struct {
+				Sender struct {
+					Nickname string          `json:"nickname"`
+					UserID   json.RawMessage `json:"user_id"`
+				} `json:"sender"`
+				Content json.RawMessage `json:"content"`
+				Message json.RawMessage `json:"message"`
+			} `json:"messages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		logger.DebugCF("onebot", "get_forward_msg parse failed", map[string]any{
+			"forward_id": id,
+			"error":      err.Error(),
+		})
+		return ""
+	}
+	if result.RetCode != 0 || len(result.Data.Messages) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "[转发内容 共%d条]\n", len(result.Data.Messages))
+	for _, node := range result.Data.Messages {
+		text := extractSegmentText(node.Content)
+		if text == "" {
+			text = extractSegmentText(node.Message)
+		}
+		if text == "" {
+			continue
+		}
+		sender := node.Sender.Nickname
+		if sender == "" {
+			sender = parseJSONString(node.Sender.UserID)
+		}
+		if sender != "" {
+			fmt.Fprintf(&sb, "%s: %s\n", sender, text)
+		} else {
+			sb.WriteString(text + "\n")
+		}
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+// extractSegmentText flattens an OneBot message (CQ-encoded string or segment
+// array) into plain text, keeping only text segments.
+func extractSegmentText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return stripCQCodes(s)
+	}
+
+	var segments []map[string]any
+	if err := json.Unmarshal(raw, &segments); err != nil {
+		return ""
+	}
+	var parts []string
+	for _, seg := range segments {
+		if segType, _ := seg["type"].(string); segType != "text" {
+			continue
+		}
+		if data, ok := seg["data"].(map[string]any); ok {
+			if t, ok := data["text"].(string); ok {
+				parts = append(parts, t)
+			}
+		}
+	}
+	return stripCQCodes(strings.Join(parts, ""))
+}
+
+// stripCQCodes removes inline [CQ:...] codes (images, faces, ...) from text.
+func stripCQCodes(s string) string {
+	for {
+		start := strings.Index(s, "[CQ:")
+		if start < 0 {
+			return s
+		}
+		offset := strings.Index(s[start:], "]")
+		if offset < 0 {
+			return s
+		}
+		s = s[:start] + s[start+offset+1:]
 	}
 }
 

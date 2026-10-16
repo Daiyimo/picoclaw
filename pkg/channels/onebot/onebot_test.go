@@ -124,3 +124,68 @@ func TestParseMessageSegments_StoresDownloadedMediaRef(t *testing.T) {
 		t.Fatalf("meta.Filename = %q, want %q", meta.Filename, "image.png")
 	}
 }
+
+func TestParseMessageSegments_ForwardFallsBackToPlaceholderWithoutConnection(t *testing.T) {
+	ch := &OneBotChannel{}
+
+	raw := json.RawMessage(`[
+		{"type":"text","data":{"text":"看看这个"}},
+		{"type":"forward","data":{"id":"7139f7c0e0b04c8a9d1c2f3a4b5c6d7e"}}
+	]`)
+
+	result := ch.parseMessageSegments(raw, 0, nil, "onebot:test:forward1")
+
+	want := "看看这个[forward message]"
+	if got := result.Text; got != want {
+		t.Fatalf("Text = %q, want %q", got, want)
+	}
+}
+
+func TestExtractSegmentText_StringAndArrayForms(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "cq string with image code",
+			raw:  `"hello [CQ:image,file=abc.jpg] world"`,
+			want: "hello  world",
+		},
+		{
+			name: "segment array keeps only text",
+			raw:  `[{"type":"text","data":{"text":"first "}},{"type":"image","data":{"file":"x.png"}},{"type":"text","data":{"text":"second"}}]`,
+			want: "first second",
+		},
+		{
+			name: "empty",
+			raw:  ``,
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw json.RawMessage
+			if tc.raw != "" {
+				raw = json.RawMessage(tc.raw)
+			}
+			if got := extractSegmentText(raw); got != tc.want {
+				t.Fatalf("extractSegmentText(%s) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStripCQCodes(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"plain text", "plain text"},
+		{"a[CQ:face,id=123]b", "ab"},
+		{"[CQ:image,file=http://x/y.png]only image", "only image"},
+		{"unclosed [CQ:image", "unclosed [CQ:image"},
+	}
+	for _, tc := range cases {
+		if got := stripCQCodes(tc.in); got != tc.want {
+			t.Fatalf("stripCQCodes(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
