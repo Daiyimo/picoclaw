@@ -150,12 +150,12 @@ func TestExtractSegmentText_StringAndArrayForms(t *testing.T) {
 		{
 			name: "cq string with image code",
 			raw:  `"hello [CQ:image,file=abc.jpg] world"`,
-			want: "hello  world",
+			want: "hello [图片] world",
 		},
 		{
 			name: "segment array keeps only text",
 			raw:  `[{"type":"text","data":{"text":"first "}},{"type":"image","data":{"file":"x.png"}},{"type":"text","data":{"text":"second"}}]`,
-			want: "first second",
+			want: "first [图片]second",
 		},
 		{
 			name: "empty",
@@ -180,12 +180,62 @@ func TestStripCQCodes(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"plain text", "plain text"},
 		{"a[CQ:face,id=123]b", "ab"},
-		{"[CQ:image,file=http://x/y.png]only image", "only image"},
+		{"[CQ:image,file=http://x/y.png]only image", "[图片]only image"},
 		{"unclosed [CQ:image", "unclosed [CQ:image"},
 	}
 	for _, tc := range cases {
 		if got := stripCQCodes(tc.in); got != tc.want {
 			t.Fatalf("stripCQCodes(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestResolveCQReferences_FallsBackToPlaceholderWithoutConnection(t *testing.T) {
+	ch := &OneBotChannel{}
+
+	cases := []struct{ name, in, want string }{
+		{
+			name: "forward code unresolved",
+			in:   "看看这个[CQ:forward,id=7697187827997083834]谢谢",
+			want: "看看这个[forward message]谢谢",
+		},
+		{
+			name: "reply code unresolved",
+			in:   "[CQ:reply,id=1165910687]",
+			want: "[quoted message]",
+		},
+		{
+			name: "no reference codes untouched",
+			in:   "普通消息[CQ:at,qq=123]",
+			want: "普通消息[CQ:at,qq=123]",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ch.resolveCQReferences(tc.in); got != tc.want {
+				t.Fatalf("resolveCQReferences(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFetchReplyText_NoConnection(t *testing.T) {
+	ch := &OneBotChannel{}
+	if got := ch.fetchReplyText("1165910687"); got != "" {
+		t.Fatalf("fetchReplyText without connection = %q, want empty", got)
+	}
+}
+
+func TestExtractSegmentText_MediaMarkers(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"text","data":{"text":"看这张"}},
+		{"type":"image","data":{"file":"a.png"}},
+		{"type":"record","data":{"file":"a.amr"}},
+		{"type":"file","data":{"file":"doc.pdf","name":"报告.pdf"}},
+		{"type":"face","data":{"id":"123"}}
+	]`)
+	want := "看这张[图片][语音][文件:报告.pdf][表情]"
+	if got := extractSegmentText(raw); got != want {
+		t.Fatalf("extractSegmentText() = %q, want %q", got, want)
 	}
 }

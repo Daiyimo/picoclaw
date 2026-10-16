@@ -820,6 +820,9 @@ func (c *OneBotChannel) parseMessageSegments(
 			if data != nil {
 				if id, ok := data["id"]; ok {
 					replyTo = fmt.Sprintf("%v", id)
+					if resolved := c.fetchReplyText(replyTo); resolved != "" {
+						textParts = append(textParts, "[引用消息] "+resolved)
+					}
 				}
 			}
 
@@ -929,19 +932,140 @@ func extractSegmentText(raw json.RawMessage) string {
 	}
 	var parts []string
 	for _, seg := range segments {
-		if segType, _ := seg["type"].(string); segType != "text" {
-			continue
-		}
-		if data, ok := seg["data"].(map[string]any); ok {
-			if t, ok := data["text"].(string); ok {
-				parts = append(parts, t)
+		segType, _ := seg["type"].(string)
+		data, _ := seg["data"].(map[string]any)
+		switch segType {
+		case "text":
+			if data != nil {
+				if t, ok := data["text"].(string); ok && t != "" {
+					parts = append(parts, t)
+				}
+			}
+		case "image":
+			parts = append(parts, "[图片]")
+		case "video":
+			parts = append(parts, "[视频]")
+		case "record":
+			parts = append(parts, "[语音]")
+		case "face":
+			parts = append(parts, "[表情]")
+		case "file":
+			name := ""
+			if data != nil {
+				if f, ok := data["file"].(string); ok {
+					name = f
+				}
+				if n, ok := data["name"].(string); ok && n != "" {
+					name = n
+				}
+			}
+			if name != "" {
+				parts = append(parts, "[文件:"+name+"]")
+			} else {
+				parts = append(parts, "[文件]")
 			}
 		}
 	}
 	return stripCQCodes(strings.Join(parts, ""))
 }
 
-// stripCQCodes removes inline [CQ:...] codes (images, faces, ...) from text.
+// fetchReplyText resolves an OneBot v11 reply segment id into the quoted
+// message's text via the get_msg action. Returns "" when unresolvable.
+func (c *OneBotChannel) fetchReplyText(messageID string) string {
+	resp, err := c.sendAPIRequest("get_msg", map[string]any{"message_id": messageID}, 5*time.Second)
+	if err != nil {
+		logger.DebugCF("onebot", "get_msg failed", map[string]any{
+			"message_id": messageID,
+			"error":       err.Error(),
+		})
+		return ""
+	}
+
+	var result struct {
+		RetCode int `json:"retcode"`
+		Data    struct {
+			RawMessage string          `json:"raw_message"`
+			Message    json.RawMessage `json:"message"`
+			Sender     struct {
+				Nickname string          `json:"nickname"`
+				UserID   json.RawMessage `json:"user_id"`
+			} `json:"sender"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		logger.DebugCF("onebot", "get_msg parse failed", map[string]any{
+			"message_id": messageID,
+			"error":       err.Error(),
+		})
+		return ""
+	}
+	if result.RetCode != 0 {
+		return ""
+	}
+
+	text := strings.TrimSpace(stripCQCodes(result.Data.RawMessage))
+	if text == "" {
+		text = extractSegmentText(result.Data.Message)
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+
+	sender := result.Data.Sender.Nickname
+	if sender == "" {
+		sender = parseJSONString(result.Data.Sender.UserID)
+	}
+	if sender != "" {
+		return sender + ": " + text
+	}
+	return text
+}
+
+// resolveCQReferences replaces raw [CQ:forward,id=...] and [CQ:reply,id=...]
+// codes in a CQ-encoded message string with their resolved content, so the
+// agent can read forwarded chat histories and quoted messages. handleMessage
+// prefers raw_message (the CQ string) over the parsed segment text, so this
+// post-processing on the final content is what actually reaches the agent.
+// Unresolvable codes fall back to a placeholder.
+func (c *OneBotChannel) resolveCQReferences(s string) string {
+	for _, kind := range []string{"forward", "reply"} {
+		prefix := "[CQ:" + kind + ",id="
+		for {
+			idx := strings.Index(s, prefix)
+			if idx < 0 {
+				break
+			}
+			end := strings.Index(s[idx:], "]")
+			if end < 0 {
+				break
+			}
+			id := s[idx+len(prefix) : idx+end]
+			var resolved string
+			if kind == "forward" {
+				resolved = c.fetchForwardText(id)
+			} else {
+				resolved = c.fetchReplyText(id)
+			}
+			if resolved == "" {
+				if kind == "forward" {
+					resolved = "[forward message]"
+				} else {
+					resolved = "[quoted message]"
+				}
+			} else if kind == "forward" {
+				resolved = "[转发内容]\n" + resolved
+			} else {
+				resolved = "[引用消息] " + resolved
+			}
+			s = s[:idx] + resolved + s[idx+end+1:]
+		}
+	}
+	return s
+}
+
+// stripCQCodes removes inline [CQ:...] codes from text. Image codes are kept
+// as a [图片] marker so the reader knows an image was there.
 func stripCQCodes(s string) string {
 	for {
 		start := strings.Index(s, "[CQ:")
@@ -952,7 +1076,11 @@ func stripCQCodes(s string) string {
 		if offset < 0 {
 			return s
 		}
-		s = s[:start] + s[start+offset+1:]
+		replacement := ""
+		if strings.HasPrefix(s[start:start+offset+1], "[CQ:image") {
+			replacement = "[图片]"
+		}
+		s = s[:start] + replacement + s[start+offset+1:]
 	}
 }
 
@@ -1087,6 +1215,10 @@ func (c *OneBotChannel) handleMessage(raw *oneBotRawEvent) {
 	if parsed.Text != "" && content != parsed.Text && (len(parsed.Media) > 0 || parsed.ReplyTo != "") {
 		content = parsed.Text
 	}
+
+	// Resolve [CQ:forward,id=...] / [CQ:reply,id=...] codes to their real
+	// content so the agent can read forwarded histories and quoted messages.
+	content = c.resolveCQReferences(content)
 
 	var sender oneBotSender
 	if len(raw.Sender) > 0 {
